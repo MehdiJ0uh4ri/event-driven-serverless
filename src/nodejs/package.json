@@ -1,0 +1,26 @@
+{
+  "name": "order-platform-functions",
+  "version": "1.0.0",
+  "description": "Event-driven order platform Lambda handlers (Node.js 20)",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/",
+    "lint": "eslint src tests"
+  },
+  "dependencies": {
+    "@aws-lambda-powertools/logger": "^2.10.0",
+    "@aws-lambda-powertools/metrics": "^2.10.0",
+    "@aws-lambda-powertools/tracer": "^2.10.0",
+    "@aws-sdk/client-dynamodb": "^3.670.0",
+    "@aws-sdk/client-eventbridge": "^3.670.0",
+    "@aws-sdk/client-sns": "^3.670.0",
+    "@aws-sdk/lib-dynamodb": "^3.670.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.12.0"
+  }
+}

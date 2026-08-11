@@ -1,0 +1,20 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /orders",
+  "rawPath": "/orders",
+  "headers": {
+    "content-type": "application/json",
+    "x-correlation-id": "local-test-correlation-id"
+  },
+  "requestContext": {
+    "http": {
+      "method": "POST",
+      "path": "/orders",
+      "sourceIp": "127.0.0.1"
+    },
+    "requestId": "local-request-id",
+    "stage": "$default"
+  },
+  "body": "{\"customerId\":\"cust-local-1\",\"items\":[{\"sku\":\"WIDGET-001\",\"quantity\":2,\"unitPrice\":19.99},{\"sku\":\"GIZMO-042\",\"quantity\":1,\"unitPrice\":149.50}],\"currency\":\"EUR\"}",
+  "isBase64Encoded": false
+}

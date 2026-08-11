@@ -1,0 +1,682 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Event-driven order platform -- SAM edition.
+
+  Deploys the same architecture as terraform/ (API Gateway -> Lambda -> DynamoDB,
+  EventBridge fan-out with DLQs, a validate/enrich/notify state machine, X-Ray and
+  SLO alarms) using SAM instead. Kept in sync deliberately: SAM is the faster
+  inner loop (`sam local invoke`, `sam sync`), Terraform is what CI deploys when
+  the stack has to sit alongside non-serverless infrastructure.
+
+  Deploy:  sam build && sam deploy --guided
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment; drives naming and alarm thresholds.
+
+  ProjectName:
+    Type: String
+    Default: order-platform
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Email for SLO alarms. Leave empty to skip the subscription.
+
+  SloAvailabilityTarget:
+    Type: Number
+    Default: 0.995
+    MinValue: 0.9
+    MaxValue: 0.9999
+
+  SloFastBurnThreshold:
+    Type: Number
+    Default: 0.072
+    Description: >
+      Error rate that constitutes a 14.4x burn of the availability error budget.
+      Compute as (1 - SloAvailabilityTarget) * 14.4 -- the default matches a
+      99.5% target. CloudFormation cannot do the arithmetic itself.
+
+  SloApiLatencyP99Ms:
+    Type: Number
+    Default: 1000
+
+  SloEventFreshnessSeconds:
+    Type: Number
+    Default: 120
+
+  ApiThrottleRateLimit:
+    Type: Number
+    Default: 200
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    MemorySize: 512
+    Timeout: 15
+    # X-Ray on every function, no exceptions.
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: !Ref ProjectName
+        POWERTOOLS_METRICS_NAMESPACE: OrderPlatform
+        POWERTOOLS_LOG_LEVEL: !Ref LogLevel
+        POWERTOOLS_LOGGER_LOG_EVENT: 'false'
+        POWERTOOLS_TRACE_ENABLED: 'true'
+        ENVIRONMENT: !Ref Environment
+        TABLE_NAME: !Ref OrdersTable
+        GSI1_NAME: gsi1-customer-index
+        EVENT_BUS_NAME: !Ref OrdersEventBus
+        EVENT_SOURCE: order.platform
+    Tags:
+      Project: !Ref ProjectName
+      Environment: !Ref Environment
+      ManagedBy: sam
+
+  Api:
+    TracingEnabled: true
+
+Resources:
+  # =========================================================================
+  # Data
+  # =========================================================================
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: !If [IsProd, Retain, Delete]
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1-customer-index
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: !If [IsProd, Retain, Delete]
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-audit'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: correlationId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: correlation-index
+          KeySchema:
+            - { AttributeName: correlationId, KeyType: HASH }
+            - { AttributeName: sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # =========================================================================
+  # Messaging
+  # =========================================================================
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-bus'
+
+  AuditDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-audit-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  AuditQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-audit'
+      VisibilityTimeout: 180        # 6x the consumer timeout
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AuditDlq.Arn
+        maxReceiveCount: 3
+
+  EventBridgeDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-eventbridge-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  WorkflowDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-workflow-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # Only our audit rule may enqueue.
+  AuditQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref AuditQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeRule
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt AuditQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt AuditAllEventsRule.Arn
+
+  EventBridgeDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventBridgeDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeRules
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventBridgeDlq.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  CustomerNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-customer-notifications'
+      KmsMasterKeyId: alias/aws/sns
+
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-ops-alerts'
+      KmsMasterKeyId: alias/aws/sns
+
+  OpsAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref OpsAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # =========================================================================
+  # API
+  # =========================================================================
+  OrdersApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+      RouteSettings:
+        $default:
+          ThrottlingRateLimit: !Ref ApiThrottleRateLimit
+          ThrottlingBurstLimit: !Ref ApiThrottleRateLimit
+          DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","correlationId":"$context.requestHeaderOverride.header.x-correlation-id","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency","xrayTraceId":"$context.xrayTraceId"}'
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type, authorization, x-correlation-id]
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}-api'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # =========================================================================
+  # Functions
+  # =========================================================================
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-create-order'
+      CodeUri: ../src/nodejs/
+      Handler: src/api/create_order.handler
+      MemorySize: 1024
+      Timeout: 10
+      Events:
+        CreateOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref OrdersApi
+            Path: /orders
+            Method: POST
+      # Least privilege: one table write, one bus publish. Nothing else.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt OrdersTable.Arn
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt OrdersEventBus.Arn
+              Condition:
+                StringEquals:
+                  events:source: order.platform
+
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-get-order'
+      CodeUri: ../src/nodejs/
+      Handler: src/api/get_order.handler
+      Timeout: 10
+      Events:
+        GetOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref OrdersApi
+            Path: /orders/{orderId}
+            Method: GET
+        ListOrders:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref OrdersApi
+            Path: /orders
+            Method: GET
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query]
+              Resource:
+                - !GetAtt OrdersTable.Arn
+                - !Sub '${OrdersTable.Arn}/index/gsi1-customer-index'
+
+  ValidateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-validate-order'
+      CodeUri: ../src/nodejs/
+      Handler: src/workflow/validate.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          MAX_ITEMS_PER_ORDER: '50'
+          MAX_ORDER_VALUE_MINOR: '1000000'
+      Policies: &WorkflowStepPolicies
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt OrdersTable.Arn
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt OrdersEventBus.Arn
+              Condition:
+                StringEquals:
+                  events:source: order.platform
+
+  EnrichOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-enrich-order'
+      CodeUri: ../src/nodejs/
+      Handler: src/workflow/enrich.handler
+      Timeout: 30
+      Policies: *WorkflowStepPolicies
+
+  NotifyCustomerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-notify-customer'
+      CodeUri: ../src/nodejs/
+      Handler: src/workflow/notify.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC_ARN: !Ref CustomerNotificationsTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt OrdersTable.Arn
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt OrdersEventBus.Arn
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref CustomerNotificationsTopic
+
+  HandleFailureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-handle-failure'
+      CodeUri: ../src/nodejs/
+      Handler: src/workflow/handle_failure.handler
+      MemorySize: 256
+      Timeout: 30
+      Policies: *WorkflowStepPolicies
+
+  AuditConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-audit-consumer'
+      CodeUri: ../src/python/audit/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 30
+      Environment:
+        Variables:
+          AUDIT_TABLE_NAME: !Ref AuditTable
+          AUDIT_RETENTION_DAYS: !If [IsProd, '365', '30']
+      Events:
+        AuditQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AuditQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 10
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+              Resource: !GetAtt AuditQueue.Arn
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt AuditTable.Arn
+
+  DlqProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-dlq-processor'
+      CodeUri: ../src/nodejs/
+      Handler: src/events/dlq_processor.handler
+      MemorySize: 256
+      Timeout: 60
+      Events:
+        AuditDlq:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AuditDlq.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 30
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+              Resource:
+                - !GetAtt AuditDlq.Arn
+                - !GetAtt EventBridgeDlq.Arn
+                - !GetAtt WorkflowDlq.Arn
+
+  # =========================================================================
+  # Step Functions
+  # =========================================================================
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-${Environment}-order-processing'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  OrderProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-order-processing'
+      Type: STANDARD
+      DefinitionUri: statemachine/order_processing.asl.json
+      DefinitionSubstitutions:
+        ValidateFunctionArn: !GetAtt ValidateOrderFunction.Arn
+        EnrichFunctionArn: !GetAtt EnrichOrderFunction.Arn
+        NotifyFunctionArn: !GetAtt NotifyCustomerFunction.Arn
+        HandleFailureFunctionArn: !GetAtt HandleFailureFunction.Arn
+        WorkflowDlqUrl: !Ref WorkflowDlq
+      Tracing:
+        Enabled: true
+      Logging:
+        Level: ALL
+        IncludeExecutionData: !If [IsProd, false, true]
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref ValidateOrderFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref EnrichOrderFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref NotifyCustomerFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref HandleFailureFunction }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt WorkflowDlq.QueueName }
+        - CloudWatchLogsFullAccess
+        - AWSXrayWriteOnlyAccess
+      Events:
+        OrderCreated:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref OrdersEventBus
+            Pattern:
+              source: [order.platform]
+              detail-type: [order.created]
+            DeadLetterConfig:
+              Arn: !GetAtt EventBridgeDlq.Arn
+            RetryPolicy:
+              MaximumRetryAttempts: 3
+              MaximumEventAgeInSeconds: 3600
+
+  # =========================================================================
+  # EventBridge rules that SAM does not generate implicitly
+  # =========================================================================
+  AuditAllEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-audit-all'
+      Description: Mirror every domain event to the audit queue
+      EventBusName: !Ref OrdersEventBus
+      EventPattern:
+        source: [order.platform]
+        detail:
+          eventType: [{ prefix: 'order.' }]
+      Targets:
+        - Id: audit-queue
+          Arn: !GetAtt AuditQueue.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDlq.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAgeInSeconds: 3600
+
+  OrderFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-order-failed'
+      Description: Alert the on-call channel when an order workflow fails
+      EventBusName: !Ref OrdersEventBus
+      EventPattern:
+        source: [order.platform]
+        detail-type: [order.failed]
+      Targets:
+        - Id: ops-alerts
+          Arn: !Ref OpsAlertsTopic
+          InputTransformer:
+            InputPathsMap:
+              orderId: $.detail.data.orderId
+              stage: $.detail.data.stage
+              message: $.detail.data.message
+              correlationId: $.detail.correlationId
+            InputTemplate: '"Order <orderId> FAILED at stage <stage>. Reason: <message>. Correlation id: <correlationId>."'
+
+  OpsAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref OpsAlertsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref OpsAlertsTopic
+          - Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref OpsAlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # =========================================================================
+  # SLO alarms (the same four as terraform/observability.tf)
+  # =========================================================================
+  AvailabilitySloAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-slo-availability-fast-burn'
+      AlarmDescription: Error budget burning 14.4x faster than sustainable. See docs/runbook.md#availability
+      ComparisonOperator: GreaterThanThreshold
+      # CloudFormation has no arithmetic, so the 14.4x burn threshold is passed
+      # in pre-computed rather than derived from SloAvailabilityTarget here.
+      # Terraform does the same maths in locals.fast_burn_threshold.
+      Threshold: !Ref SloFastBurnThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: error_rate
+          Expression: IF(requests > 0, errors / requests, 0)
+          Label: 5xx error rate
+          ReturnData: true
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: 5xx
+              Dimensions: [{ Name: ApiId, Value: !Ref OrdersApi }]
+            Period: 300
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: Count
+              Dimensions: [{ Name: ApiId, Value: !Ref OrdersApi }]
+            Period: 300
+            Stat: Sum
+      AlarmActions: [!Ref OpsAlertsTopic]
+      OKActions: [!Ref OpsAlertsTopic]
+
+  ApiLatencySloAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-slo-api-latency-p99'
+      AlarmDescription: p99 API latency above objective. See docs/runbook.md#latency
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions: [{ Name: ApiId, Value: !Ref OrdersApi }]
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref SloApiLatencyP99Ms
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  EventFreshnessSloAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-slo-event-freshness'
+      AlarmDescription: Audit backlog is stale. See docs/runbook.md#backlog
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{ Name: QueueName, Value: !GetAtt AuditQueue.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref SloEventFreshnessSeconds
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-dlq-audit-not-empty'
+      AlarmDescription: Messages stuck on the audit DLQ. See docs/runbook.md#dlq
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt AuditDlq.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL of the orders API
+    Value: !Sub 'https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  EventBusName:
+    Description: Custom EventBridge bus
+    Value: !Ref OrdersEventBus
+
+  StateMachineArn:
+    Description: Order processing state machine
+    Value: !Ref OrderProcessingStateMachine
+
+  OrdersTableName:
+    Value: !Ref OrdersTable
+
+  AuditTableName:
+    Value: !Ref AuditTable
+
+  AuditQueueUrl:
+    Value: !Ref AuditQueue
+
+  OpsAlertsTopicArn:
+    Value: !Ref OpsAlertsTopic

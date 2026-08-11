@@ -1,0 +1,31 @@
+{
+  "version": "0",
+  "id": "00000000-0000-0000-0000-000000000001",
+  "detail-type": "order.created",
+  "source": "order.platform",
+  "account": "000000000000",
+  "time": "2026-08-01T10:00:00Z",
+  "region": "eu-west-1",
+  "resources": [],
+  "detail": {
+    "eventId": "00000000-0000-0000-0000-0000000000aa",
+    "eventType": "order.created",
+    "eventVersion": "1.0",
+    "occurredAt": "2026-08-01T10:00:00.000Z",
+    "correlationId": "local-test-correlation-id",
+    "causationId": null,
+    "source": "order.platform",
+    "data": {
+      "orderId": "00000000-0000-0000-0000-0000000000ff",
+      "customerId": "cust-local-1",
+      "items": [
+        { "sku": "WIDGET-001", "quantity": 2, "unitPrice": 19.99 },
+        { "sku": "GIZMO-042", "quantity": 1, "unitPrice": 149.5 }
+      ],
+      "currency": "EUR",
+      "totalMinor": 18948,
+      "status": "PENDING",
+      "createdAt": "2026-08-01T10:00:00.000Z"
+    }
+  }
+}

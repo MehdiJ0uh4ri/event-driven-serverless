@@ -2,17 +2,11 @@
 
 /** HTTP response helpers for API Gateway (HTTP API / payload format 2.0). */
 
-const { CORRELATION_HEADER } = require('./observability');
-
-/** Errors thrown with this class produce a 4xx instead of a 500. */
-class ClientError extends Error {
-  constructor(message, statusCode = 400, details = undefined) {
-    super(message);
-    this.name = 'ClientError';
-    this.statusCode = statusCode;
-    this.details = details;
-  }
-}
+// Deliberately imports from errors.js rather than observability.js: this
+// module stays free of the Powertools dependency so it can be unit-tested
+// without a runtime.
+const { ClientError } = require('./errors');
+const { CORRELATION_HEADER } = require('./correlation');
 
 function respond(statusCode, body, correlationId, extraHeaders = {}) {
   return {

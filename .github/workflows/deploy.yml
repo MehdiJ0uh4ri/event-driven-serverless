@@ -1,0 +1,151 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        type: choice
+        options: [dev, prod]
+        default: dev
+      run_benchmarks:
+        description: Run the cold-start benchmark sweep after deploying
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # the benchmark job commits docs/benchmarks.md
+  id-token: write # OIDC
+
+env:
+  AWS_REGION: eu-west-1
+  TF_VERSION: '1.9.8'
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.12'
+
+concurrency:
+  # Never let two applies race for the same state file.
+  group: deploy-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    outputs:
+      api_endpoint: ${{ steps.outputs.outputs.api_endpoint }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: src/nodejs/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: src/go/go.sum
+
+      - name: Build deployment artefacts
+        run: ./scripts/build.sh
+        env:
+          LAMBDA_ARCH: arm64
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          ENV: ${{ inputs.environment || 'dev' }}
+        run: |
+          terraform init -backend-config="envs/${ENV}/backend.hcl"
+          terraform apply -auto-approve -var-file="envs/${ENV}/terraform.tfvars"
+
+      - name: Capture outputs
+        id: outputs
+        working-directory: terraform
+        run: |
+          terraform output -json > ../tf-output.json
+          echo "api_endpoint=$(terraform output -raw api_endpoint)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terraform-output-${{ inputs.environment || 'dev' }}
+          path: tf-output.json
+
+      # The gate: a deploy that passes terraform apply but fails the end-to-end
+      # path is still a failed deploy.
+      - name: End-to-end smoke test
+        run: |
+          pip install boto3
+          python tools/smoke_test.py --terraform-output tf-output.json
+
+      - name: Post-deploy cost projection against the live stack
+        run: |
+          python tools/cost_model.py \
+            --terraform-output tf-output.json \
+            --profile "tools/profiles/${ENV}.json" \
+            --format table
+        env:
+          ENV: ${{ inputs.environment || 'dev' }}
+        continue-on-error: true
+
+      - name: Roll back on smoke-test failure
+        if: failure()
+        run: |
+          echo "::error::Deploy failed verification. The previous version is still"
+          echo "::error::in state; run 'terraform apply' from the last good commit,"
+          echo "::error::or use the alias rollback in docs/runbook.md#rollback."
+          exit 1
+
+  # -------------------------------------------------------------------------
+  benchmark:
+    name: Cold-start benchmark sweep
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: inputs.run_benchmarks == true
+    environment: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run the sweep
+        run: |
+          pip install boto3
+          python tools/coldstart_benchmark.py \
+            --discover \
+            --samples 25 \
+            --format markdown \
+            --output docs/benchmarks.md
+
+      - name: Commit the results
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add docs/benchmarks.md
+          git diff --staged --quiet || git commit -m 'chore: refresh cold-start benchmarks [skip ci]'
+          git push

@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write # for the cost comment
+  id-token: write      # for OIDC into AWS on the plan job
+
+env:
+  AWS_REGION: eu-west-1
+  TF_VERSION: '1.9.8'
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # -------------------------------------------------------------------------
+  lint-and-test:
+    name: Lint & unit test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: src/nodejs/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Node dependencies
+        working-directory: src/nodejs
+        run: npm ci --no-audit --no-fund
+
+      - name: Node unit tests
+        working-directory: src/nodejs
+        run: node --test tests/
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest boto3 'aws-lambda-powertools[tracer]==2.43.1'
+
+      - name: Python unit tests
+        run: pytest src/python/tests tools/tests -q
+
+  # -------------------------------------------------------------------------
+  terraform-validate:
+    name: Terraform validate & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        working-directory: terraform
+        # No backend: validation must not need credentials or remote state.
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: tflint
+        uses: terraform-linters/setup-tflint@v4
+      - run: tflint --recursive --minimum-failure-severity=error
+        working-directory: terraform
+
+  # -------------------------------------------------------------------------
+  security-scan:
+    name: IaC security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform,cloudformation
+          quiet: true
+          soft_fail: false
+          # Documented, deliberate exceptions -- each one is justified in
+          # docs/architecture.md rather than silently suppressed.
+          skip_check: >-
+            CKV_AWS_116,
+            CKV_AWS_117,
+            CKV_AWS_158,
+            CKV_AWS_173,
+            CKV2_AWS_5
+
+      - name: Validate the SAM template
+        run: |
+          pip install aws-sam-cli
+          sam validate --template sam/template.yaml --lint --region ${{ env.AWS_REGION }}
+
+  # -------------------------------------------------------------------------
+  cost-projection:
+    name: Cost projection
+    runs-on: ubuntu-latest
+    needs: [lint-and-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # This is the guardrail: a change that makes the platform materially more
+      # expensive fails here rather than showing up on next month's invoice.
+      - name: Project the monthly cost against the prod profile
+        id: cost
+        run: |
+          python tools/cost_model.py \
+            --profile tools/profiles/prod.json \
+            --budget "${COST_BUDGET_USD:-250}" \
+            --format markdown \
+            --output cost-report.md \
+            --fail-on-breach
+        env:
+          COST_BUDGET_USD: ${{ vars.COST_BUDGET_USD }}
+
+      - name: Comment the projection on the PR
+        # Runs even when the budget check failed -- the number is the whole
+        # point of the comment, especially when it is over budget.
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: cost-projection
+          path: cost-report.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cost-report
+          path: cost-report.md
+
+  # -------------------------------------------------------------------------
+  terraform-plan:
+    name: Terraform plan (dev)
+    runs-on: ubuntu-latest
+    needs: [terraform-validate, lint-and-test]
+    if: github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN != ''
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build deployment artefacts
+        run: ./scripts/build.sh
+
+      - name: Configure AWS credentials (OIDC, read-only plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Plan
+        working-directory: terraform
+        run: |
+          terraform init -backend-config=envs/dev/backend.hcl
+          terraform plan -var-file=envs/dev/terraform.tfvars -out=tfplan -no-color > plan.txt
+
+      - name: Render the plan as a PR comment
+        working-directory: terraform
+        run: |
+          {
+            echo '### Terraform plan (dev)'
+            echo
+            echo '<details><summary>Show plan</summary>'
+            echo
+            echo '```terraform'
+            # GitHub caps a comment at 65536 characters; keep the tail, which
+            # is where the summary line lives.
+            tail -c 60000 plan.txt
+            echo '```'
+            echo
+            echo '</details>'
+          } > plan-comment.md
+
+      - name: Comment the plan on the PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: terraform-plan
+          path: terraform/plan-comment.md

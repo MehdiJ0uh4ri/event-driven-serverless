@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /**
  * GET /orders/{orderId}
@@ -6,15 +6,9 @@
  */
 
 const { withObservability, logger, metrics, MetricUnit } = require('../common/observability');
-const { ok, notFound, errorResponse, ClientError } = require('../common/http');
-const { getOrder, listOrdersByCustomer } = require('../common/orders');
-
-/** Strip internal single-table keys before handing the item to a caller. */
-function toPublic(item) {
-  if (!item) return item;
-  const { pk, sk, gsi1pk, gsi1sk, entityType, ttl, ...rest } = item;
-  return rest;
-}
+const { ok, notFound, errorResponse } = require('../common/http');
+const { ClientError } = require('../common/errors');
+const { getOrder, listOrdersByCustomer, toPublicOrder } = require('../common/orders');
 
 async function handle(event, _context, { correlationId }) {
   try {
@@ -28,7 +22,7 @@ async function handle(event, _context, { correlationId }) {
         return notFound(`Order ${orderId} not found`, correlationId);
       }
       logger.info('order fetched', { orderId, status: order.status });
-      return ok({ order: toPublic(order), correlationId }, correlationId);
+      return ok({ order: toPublicOrder(order), correlationId }, correlationId);
     }
 
     if (customerId) {
@@ -39,7 +33,7 @@ async function handle(event, _context, { correlationId }) {
       const orders = await listOrdersByCustomer(customerId, limit);
       logger.info('orders listed', { customerId, count: orders.length });
       return ok(
-        { orders: orders.map(toPublic), count: orders.length, correlationId },
+        { orders: orders.map(toPublicOrder), count: orders.length, correlationId },
         correlationId
       );
     }
@@ -52,3 +46,4 @@ async function handle(event, _context, { correlationId }) {
 }
 
 exports.handler = withObservability('getOrder', handle);
+

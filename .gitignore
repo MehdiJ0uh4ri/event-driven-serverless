@@ -1,0 +1,39 @@
+# Build artefacts
+dist/
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.zip
+bootstrap
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+plan.txt
+plan-comment.md
+crash.log
+# Never commit a tfvars that might hold secrets; the checked-in env files are
+# explicitly whitelisted below.
+*.auto.tfvars
+!terraform/envs/*/terraform.tfvars
+
+# Outputs captured by CI and the Makefile
+tf-output.json
+cost-report.md
+
+# SAM
+.aws-sam/
+samconfig.toml
+
+# Local
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/

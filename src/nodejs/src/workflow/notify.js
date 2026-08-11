@@ -13,15 +13,9 @@ const { withObservability, logger, metrics, MetricUnit } = require('../common/ob
 const { sns } = require('../common/clients');
 const { OrderStatus, updateOrderStatus } = require('../common/orders');
 const { EventType, buildEnvelope, publish } = require('../common/events');
+const { TransientError } = require('../common/errors');
 
 const TOPIC_ARN = process.env.NOTIFICATION_TOPIC_ARN;
-
-class TransientError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'TransientError';
-  }
-}
 
 function renderMessage(order) {
   const e = order.enrichment || {};

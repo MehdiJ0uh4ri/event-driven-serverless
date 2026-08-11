@@ -12,13 +12,7 @@
 const { withObservability, logger, metrics, MetricUnit } = require('../common/observability');
 const { OrderStatus, updateOrderStatus } = require('../common/orders');
 const { EventType, buildEnvelope, publish } = require('../common/events');
-
-class TransientError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'TransientError';
-  }
-}
+const { TransientError } = require('../common/errors');
 
 const TIER_DISCOUNT_BPS = { PLATINUM: 1000, GOLD: 500, SILVER: 200, STANDARD: 0 };
 
@@ -30,7 +24,7 @@ async function fetchCustomerProfile(customerId) {
   if (customerId.startsWith('FAIL-')) {
     throw new TransientError(`Customer service unavailable for ${customerId}`);
   }
-  const hash = [...customerId].reduce((a, c) => a + c.charCodeAt(0), 0);
+  const hash = [...customerId].reduce((a, c) => a + c.codePointAt(0), 0);
   const tiers = ['STANDARD', 'SILVER', 'GOLD', 'PLATINUM'];
   return {
     customerId,

@@ -14,21 +14,7 @@
 const { withObservability, logger, metrics, MetricUnit } = require('../common/observability');
 const { OrderStatus, updateOrderStatus } = require('../common/orders');
 const { EventType, buildEnvelope, publish } = require('../common/events');
-
-class ValidationError extends Error {
-  constructor(message, violations = []) {
-    super(message);
-    this.name = 'ValidationError';
-    this.violations = violations;
-  }
-}
-
-class TransientError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'TransientError';
-  }
-}
+const { ValidationError, TransientError } = require('../common/errors');
 
 const MAX_ITEMS_PER_ORDER = Number(process.env.MAX_ITEMS_PER_ORDER || 50);
 const MAX_ORDER_VALUE_MINOR = Number(process.env.MAX_ORDER_VALUE_MINOR || 1_000_000); // 10k

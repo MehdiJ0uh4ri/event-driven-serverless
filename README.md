@@ -1,5 +1,7 @@
 # Event-driven serverless platform on AWS
 
+![Event-Driven Serverless Platform](docs/Event-Driven%20Serverless%20Platform%20Banner.jpg)
+
 An order-processing platform built the way a production team would build it:
 API Gateway → Lambda → DynamoDB on the synchronous path, EventBridge → SQS →
 Step Functions on the asynchronous one, everything in IaC, with the
@@ -50,6 +52,15 @@ and CI can do it unattended.
 
   X-Ray traces every arrow. One correlation id threads every box.
 ```
+
+## Architecture
+
+![Architecture](docs/architecture.svg)
+
+Source: [docs/architecture.drawio](docs/architecture.drawio). You can open or edit it at
+[app.diagrams.net](https://app.diagrams.net) or in the VS Code *Draw.io Integration*
+extension. After editing, export it over `docs/architecture.svg` (File → Export as → SVG).
+More detail in [docs/architecture.md](docs/architecture.md).
 
 ## What is here
 

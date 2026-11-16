@@ -1,0 +1,21 @@
+{
+  "name": "prod",
+  "orders_per_month": 2000000,
+  "reads_per_month": 8000000,
+  "failure_rate": 0.015,
+  "dlq_rate": 0.0005,
+  "durations_ms": {
+    "create-order": 95.0,
+    "get-order": 38.0,
+    "validate-order": 62.0,
+    "enrich-order": 140.0,
+    "notify-customer": 105.0,
+    "handle-failure": 85.0,
+    "audit-consumer": 210.0,
+    "dlq-processor": 55.0
+  },
+  "log_bytes_per_invocation": 1536,
+  "order_item_bytes": 1500,
+  "audit_item_bytes": 1200,
+  "xray_sample_rate": 0.05
+}

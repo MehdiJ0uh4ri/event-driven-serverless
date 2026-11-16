@@ -1,0 +1,9 @@
+{
+  "name": "dev",
+  "orders_per_month": 10000,
+  "reads_per_month": 30000,
+  "failure_rate": 0.05,
+  "dlq_rate": 0.01,
+  "log_bytes_per_invocation": 6144,
+  "xray_sample_rate": 1.0
+}
